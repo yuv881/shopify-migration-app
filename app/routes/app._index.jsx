@@ -42,17 +42,41 @@ export async function action({ request }) {
         queryStringAuth: true,
       });
 
-      const response = await api.get("products", { per_page: 50 });
-      const wooProducts = response.data;
+      const page = parseInt(formData.get("page") || "1", 10);
+      
+      console.log(`Fetching page ${page}...`);
+      const response = await api.get("products", {
+        per_page: 50,
+        page: page,
+      });
 
-      if (!Array.isArray(wooProducts)) {
+      const products = response.data;
+
+      if (!Array.isArray(products)) {
         return {
           success: false,
           error: "Invalid response format from WooCommerce. Expected array.",
         };
       }
 
-      return { success: true, products: wooProducts, intent: "fetch_woo" };
+      let totalPages = 1;
+      let totalProducts = products.length;
+
+      if (response.headers["x-wp-totalpages"]) {
+        totalPages = parseInt(response.headers["x-wp-totalpages"], 10);
+      }
+      if (response.headers["x-wp-total"]) {
+        totalProducts = parseInt(response.headers["x-wp-total"], 10);
+      }
+
+      return { 
+        success: true, 
+        products: products, 
+        intent: "fetch_woo",
+        page: page, 
+        totalPages: totalPages,
+        totalProducts: totalProducts
+      };
     } catch (err) {
       console.error("Fetch error:", err);
       return { success: false, error: `Detailed Error: ${err.message}` };
@@ -153,10 +177,10 @@ export default function Index() {
 
   const [url, setUrl] = useState("http://aurelia.local/");
   const [consumerKey, setConsumerKey] = useState(
-    "ck_52b365c5ece4b8ac05bba32bf9d17c1f6ef14d38",
+    "ck_cc798a8e1f1a758ed5282e46aa9b1d017d939c49",
   );
   const [consumerSecret, setConsumerSecret] = useState(
-    "cs_2796315b6fc10f905ef4f36170b9b727ee42142e",
+    "cs_b9d97bc5586c05562d84940f709a93b6d219b262",
   );
 
   const [productsQueue, setProductsQueue] = useState([]);
@@ -164,16 +188,24 @@ export default function Index() {
   const [isMigrating, setIsMigrating] = useState(false);
   const [stats, setStats] = useState({ created: 0, updated: 0, failed: 0 });
   const [generalError, setGeneralError] = useState(null);
+  
+  // Pagination State
+  const [currentPage, setCurrentPage] = useState(0);
+  const [totalPages, setTotalPages] = useState(1);
+  const [totalProducts, setTotalProducts] = useState(0);
 
   const handleStart = () => {
     setGeneralError(null);
     setStats({ created: 0, updated: 0, failed: 0 });
     setProductsQueue([]);
     setCurrentIndex(0);
+    setCurrentPage(0);
+    setTotalPages(1);
+    setTotalProducts(0);
     setIsMigrating(true);
 
     fetcher.submit(
-      { intent: "fetch_woo", url, consumerKey, consumerSecret },
+      { intent: "fetch_woo", url, consumerKey, consumerSecret, page: "1" },
       { method: "POST" },
     );
   };
@@ -182,6 +214,10 @@ export default function Index() {
     if (fetcher.data && fetcher.data.intent === "fetch_woo") {
       if (fetcher.data.success) {
         setProductsQueue(fetcher.data.products);
+        setCurrentIndex(0); // Reset for new batch
+        setCurrentPage(fetcher.data.page);
+        setTotalPages(fetcher.data.totalPages);
+        setTotalProducts(fetcher.data.totalProducts);
       } else {
         setGeneralError(fetcher.data.error);
         setIsMigrating(false);
@@ -193,8 +229,8 @@ export default function Index() {
     if (!isMigrating || productsQueue.length === 0) return;
 
     if (currentIndex >= productsQueue.length) {
-      setIsMigrating(false);
-      return;
+       // Wait for next fetching triggers
+       return;
     }
 
     if (migrateFetcher.state === "idle" && !migrateFetcher.data) {
@@ -224,7 +260,17 @@ export default function Index() {
         if (nextIndex < productsQueue.length) {
           triggerMigration(productsQueue[nextIndex]);
         } else {
-          setIsMigrating(false);
+          // Batch processed. Check if more pages exist.
+          if (currentPage < totalPages) {
+             const nextPage = currentPage + 1;
+             console.log(`Fetching next page: ${nextPage}`);
+             fetcher.submit(
+               { intent: "fetch_woo", url, consumerKey, consumerSecret, page: nextPage.toString() },
+               { method: "POST" }
+             );
+          } else {
+             setIsMigrating(false);
+          }
         }
       }
     }
@@ -241,11 +287,13 @@ export default function Index() {
     );
   };
 
-  const total = productsQueue.length;
-  const progress = total > 0 ? (currentIndex / total) * 100 : 0;
+  const overallProgress = totalProducts > 0 
+    ? ((stats.created + stats.updated + stats.failed) / totalProducts) * 100 
+    : 0;
+
   const isFetchingList =
     fetcher.state === "submitting" || fetcher.state === "loading";
-  const isProcessing = isMigrating && productsQueue.length > 0;
+  const isProcessing = isMigrating; // Generalized check
 
   return (
     <Page title="Woo Migration">
@@ -287,7 +335,7 @@ export default function Index() {
               <p>{generalError}</p>
             </Banner>
           )}
-          {(isProcessing || (total > 0 && !isProcessing)) && (
+          {(isProcessing || (stats.created + stats.updated + stats.failed > 0)) && (
             <div
               style={{
                 marginTop: "10px",
@@ -306,15 +354,15 @@ export default function Index() {
                   borderRadius: "6px",
                 }}
               >
-                <ProgressBar size="small" progress={progress} tone="success" />
+                <ProgressBar size="small" progress={overallProgress} tone="success" />
               </div>
               <div style={{ marginTop: "10px" }}>
                 <Text as="p">
-                  Processed: {currentIndex} / {total}
+                  Page: {currentPage} / {totalPages}
                 </Text>
                 <Text as="p" tone="subdued">
                   Created: {stats.created} | Updated: {stats.updated} | Failed:{" "}
-                  {stats.failed}
+                  {stats.failed} | Total: {totalProducts}
                 </Text>
               </div>
             </div>
